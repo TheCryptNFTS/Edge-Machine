@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Edge Machine</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+
+<body class="bg-gray-950 text-gray-100 min-h-screen font-sans">
+  <div class="max-w-5xl mx-auto px-4 py-8">
+    <div class="flex items-center justify-between mb-8">
+      <h1 class="text-3xl font-bold">Edge Machine</h1>
+      <button id="refresh" class="px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded transition">
+        Refresh
+      </button>
+    </div>
+
+    <div id="status" class="mb-6 text-lg font-medium">Loading markets...</div>
+
+    <div class="overflow-x-auto">
+      <table class="w-full text-sm border-collapse">
+        <thead>
+          <tr class="bg-gray-800">
+            <th class="p-3 text-left">Event</th>
+            <th class="p-3 text-left">Crowd (PM)</th>
+            <th class="p-3 text-left">Machine</th>
+            <th class="p-3 text-left">Signal</th>
+          </tr>
+        </thead>
+        <tbody id="table"></tbody>
+      </table>
+    </div>
+
+    <div id="error" class="mt-6 text-red-400 hidden"></div>
+  </div>
+
+  <script>
+    // ✅ Your live Railway backend
+    const API = "https://edge-machine-production.up.railway.app";
+
+    async function load() {
+      const status = document.getElementById("status");
+      const table = document.getElementById("table");
+      const error = document.getElementById("error");
+      error.classList.add("hidden");
+
+      status.textContent = "Loading...";
+      table.innerHTML = "";
+
+      try {
+        // Pull more than 5 so you see something after bootstraps
+        const r = await fetch(API + "/v1/events?limit=50", { cache: "no-store" });
+        if (!r.ok) throw new Error("API error: " + r.status);
+        const data = await r.json();
+
+        if (!data.length) {
+          status.textContent = "No markets yet — bootstrap needed";
+          return;
+        }
+
+        data.forEach(e => {
+          const crowdNum = (typeof e.latest_pm_p === "number") ? e.latest_pm_p : null;
+          const machNum  = (typeof e.latest_machine_p === "number") ? e.latest_machine_p : null;
+
+          const crowd = (crowdNum !== null) ? (crowdNum * 100).toFixed(1) + "%" : "—";
+          const machine = (machNum !== null) ? (machNum * 100).toFixed(1) + "%" : "—";
+
+          // Only show signal if both exist
+          let signal = "—";
+          let color = "text-gray-400";
+          if (crowdNum !== null && machNum !== null) {
+            signal = (crowdNum > machNum) ? "FADE YES" : "RIDE YES";
+            color = (crowdNum > machNum) ? "text-red-400" : "text-emerald-400";
+          }
+
+          const row = document.createElement("tr");
+          row.className = "border-b border-gray-800";
+          row.innerHTML = `
+            <td class="p-3">${e.title}</td>
+            <td class="p-3">${crowd}</td>
+            <td class="p-3">${machine}</td>
+            <td class="p-3 font-bold ${color}">${signal}</td>
+          `;
+          table.appendChild(row);
+        });
+
+        status.textContent = "Live";
+      } catch (e) {
+        status.textContent = "Error connecting";
+        error.textContent = e.message;
+        error.classList.remove("hidden");
+      }
+    }
+
+    document.getElementById("refresh").onclick = load;
+    load();
+    setInterval(load, 30000);
+  </script>
+</body>
+</html>
