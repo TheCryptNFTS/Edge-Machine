@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
@@ -28,17 +28,21 @@ GAMMA_BASE = os.getenv("PM_GAMMA_BASE", "https://gamma-api.polymarket.com").rstr
 CLOB_BASE = os.getenv("PM_CLOB_BASE", "https://clob.polymarket.com").rstrip("/")
 
 DISCOVER_LIMIT = int(os.getenv("PM_DISCOVER_LIMIT", "50"))
-DISCOVER_PAGES = int(os.getenv("PM_DISCOVER_PAGES", "5"))
 DISCOVER_KEYWORDS = os.getenv(
     "PM_DISCOVER_KEYWORDS",
     "bitcoin,btc,ethereum,eth,sol,solana,crypto,memecoin,doge,ai,trump,election,fed,inflation,rate"
 )
 
+# ---- timeout-safe knobs ----
+JOB_TIME_BUDGET_SECS = int(os.getenv("PM_JOB_TIME_BUDGET_SECS", "8"))
+DISCOVER_DETAIL_MAX = int(os.getenv("PM_DISCOVER_DETAIL_MAX", "10"))
+PRICE_UPDATE_MAX = int(os.getenv("PM_PRICE_UPDATE_MAX", "20"))
+
 # =========================
 # APP
 # =========================
 
-app = FastAPI(title="Edge Machine API", version="0.9.0")
+app = FastAPI(title="Edge Machine API", version="1.0.0-timebudget")
 
 app.add_middleware(
     CORSMiddleware,
@@ -133,10 +137,7 @@ def fnum(x) -> float:
         return 0.0
 
 def machine_from_pm(p_pm: float) -> float:
-    """
-    Minimal machine until you re-plug your full v0.2 ensemble.
-    Stable & safe.
-    """
+    # Minimal stable machine (swap for full v0.2 later)
     p = 0.90 * p_pm + 0.10 * 0.5
     if p_pm >= 0.94:
         p = min(p, 0.995)
@@ -145,7 +146,7 @@ def machine_from_pm(p_pm: float) -> float:
     return clamp01(p)
 
 # =========================
-# POLYMARKET: CLOB PRICE
+# POLYMARKET: CLOB
 # =========================
 
 def clob_midpoint(token_id: str) -> Optional[float]:
@@ -183,7 +184,6 @@ def gamma_get_markets(limit: int = 100, offset: int = 0) -> list[dict]:
     return data.get("markets") or data.get("data") or []
 
 def gamma_get_detail(mid: str) -> Optional[dict]:
-    # Token IDs often only exist on detail endpoints
     for url in [f"{GAMMA_BASE}/markets/{mid}", f"{GAMMA_BASE}/market/{mid}"]:
         try:
             r = requests.get(url, timeout=15)
@@ -194,9 +194,6 @@ def gamma_get_detail(mid: str) -> Optional[dict]:
     return None
 
 def extract_yes_token_id(m: dict) -> Optional[str]:
-    """
-    Best-effort YES token extraction.
-    """
     tokens = m.get("tokens") or m.get("outcomes") or []
     if isinstance(tokens, list):
         for t in tokens:
@@ -206,67 +203,35 @@ def extract_yes_token_id(m: dict) -> Optional[str]:
                     if t.get(k):
                         return str(t.get(k))
 
-    # fallback: clobTokenIds (binary markets often yes first)
     clob_ids = m.get("clobTokenIds") or m.get("clob_token_ids")
     if isinstance(clob_ids, list) and clob_ids:
         return str(clob_ids[0])
 
-    # fallback: root keys
     for k in ("yesTokenId", "yes_token_id"):
         if m.get(k):
             return str(m.get(k))
 
     return None
 
-def _try_parse_iso(dt_value) -> Optional[datetime]:
-    if not dt_value:
-        return None
-    try:
-        s = str(dt_value).replace("Z", "+00:00")
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except Exception:
-        return None
-
 def is_current(m: dict) -> bool:
-    """
-    Best-effort filter: try to avoid clearly closed markets.
-    Gamma schemas vary, so we keep this permissive.
-    """
-    # If an explicit active flag exists and is false -> drop
     if "active" in m and m.get("active") is False:
         return False
-
-    # Try common end/close fields
-    for k in ("end_date", "endDate", "closeTime", "close_time", "closeDate", "close_date"):
-        dt = _try_parse_iso(m.get(k))
-        if dt and dt < datetime.now(timezone.utc):
-            return False
-
+    # permissive otherwise
     return True
 
-def upsert_event(
-    title: str,
-    slug: Optional[str],
-    gamma_market_id: Optional[str],
-    yes_token_id: Optional[str],
-) -> None:
+def upsert_event(title: str, slug: Optional[str], gamma_market_id: Optional[str], yes_token_id: Optional[str]) -> None:
     now = datetime.now(timezone.utc).isoformat()
     with db() as conn:
         row = None
         if slug:
             row = conn.execute("SELECT id FROM events WHERE slug = ?", (slug,)).fetchone()
-
         if not row and gamma_market_id:
             row = conn.execute("SELECT id FROM events WHERE gamma_market_id = ?", (gamma_market_id,)).fetchone()
-
         if not row and yes_token_id:
             row = conn.execute("SELECT id FROM events WHERE yes_token_id = ?", (yes_token_id,)).fetchone()
 
         if row:
-            # do not wipe token if new is None
+            # Don't wipe token if new is None
             if yes_token_id:
                 conn.execute(
                     """UPDATE events
@@ -289,7 +254,6 @@ def upsert_event(
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (eid, title, now, slug, gamma_market_id, yes_token_id, None, None)
             )
-
         conn.commit()
 
 # =========================
@@ -340,43 +304,43 @@ def admin_run_job(job_name: str = Query(...), x_admin_token: Optional[str] = Hea
         raise HTTPException(status_code=400, detail="Unknown job")
 
     # -------------------------
-    # 1) DISCOVER MARKETS (REAL + DETAIL ENRICHMENT)
+    # DISCOVER MARKETS (FAST / NO TIMEOUT)
     # -------------------------
     if job_name == "discover_markets":
+        t0 = time.time()
         keywords = [k.strip().lower() for k in DISCOVER_KEYWORDS.split(",") if k.strip()]
+
+        markets = gamma_get_markets(limit=100, offset=0)
+
+        # filter by keywords and sort by volume/liquidity
         candidates: list[tuple[float, dict]] = []
-        offset = 0
-
-        for _ in range(DISCOVER_PAGES):
-            markets = gamma_get_markets(limit=100, offset=offset)
-            if not markets:
+        for m in markets:
+            if time.time() - t0 > JOB_TIME_BUDGET_SECS:
                 break
+            title = (m.get("question") or m.get("title") or "").strip()
+            if not title:
+                continue
+            if not is_current(m):
+                continue
+            tl = title.lower()
+            if not any(k in tl for k in keywords):
+                continue
 
-            for m in markets:
-                title = (m.get("question") or m.get("title") or "").strip()
-                if not title:
-                    continue
-                if not is_current(m):
-                    continue
-
-                tl = title.lower()
-                if not any(k in tl for k in keywords):
-                    continue
-
-                vol = fnum(m.get("volume") or m.get("volume24h") or m.get("volume_24hr") or 0)
-                liq = fnum(m.get("liquidity") or 0)
-                score = vol + (0.1 * liq)
-
-                candidates.append((score, m))
-
-            offset += 100
+            vol = fnum(m.get("volume") or m.get("volume24h") or m.get("volume_24hr") or 0)
+            liq = fnum(m.get("liquidity") or 0)
+            score = vol + (0.1 * liq)
+            candidates.append((score, m))
 
         candidates.sort(key=lambda x: x[0], reverse=True)
 
         used = 0
         tokened = 0
+        detail_calls = 0
 
         for _, m in candidates[:DISCOVER_LIMIT]:
+            if time.time() - t0 > JOB_TIME_BUDGET_SECS:
+                break
+
             title = (m.get("question") or m.get("title") or "").strip()
             slug = m.get("slug")
             mid = m.get("id") or m.get("marketId") or m.get("market_id")
@@ -384,30 +348,47 @@ def admin_run_job(job_name: str = Query(...), x_admin_token: Optional[str] = Hea
             if not gamma_market_id:
                 continue
 
-            detail = gamma_get_detail(gamma_market_id) or m
-            yes_tid = extract_yes_token_id(detail)  # now much more likely
+            # fast attempt from list payload
+            yes_tid = extract_yes_token_id(m)
+
+            # slow detail attempts limited
+            if not yes_tid and detail_calls < DISCOVER_DETAIL_MAX:
+                detail = gamma_get_detail(gamma_market_id)
+                detail_calls += 1
+                if detail:
+                    yes_tid = extract_yes_token_id(detail)
 
             upsert_event(
                 title=title,
                 slug=slug,
                 gamma_market_id=gamma_market_id,
-                yes_token_id=yes_tid,
+                yes_token_id=yes_tid
             )
             used += 1
             if yes_tid:
                 tokened += 1
 
-        return {"ok": True, "job": job_name, "discovered": used, "tokened": tokened}
+        return {
+            "ok": True,
+            "job": job_name,
+            "discovered": used,
+            "tokened": tokened,
+            "detail_calls": detail_calls,
+            "time_secs": round(time.time() - t0, 3),
+        }
 
     # -------------------------
-    # 2) SNAPSHOT PM PRICES (only where token exists)
+    # SNAPSHOT PM PRICES
     # -------------------------
     if job_name == "snapshot_pm":
+        t0 = time.time()
         updated = 0
         skipped_no_token = 0
         with db() as conn:
-            rows = conn.execute("SELECT id, yes_token_id FROM events").fetchall()
+            rows = conn.execute("SELECT id, yes_token_id FROM events ORDER BY created_at DESC LIMIT ?", (PRICE_UPDATE_MAX,)).fetchall()
             for r in rows:
+                if time.time() - t0 > JOB_TIME_BUDGET_SECS:
+                    break
                 if not r["yes_token_id"]:
                     skipped_no_token += 1
                     continue
@@ -421,14 +402,17 @@ def admin_run_job(job_name: str = Query(...), x_admin_token: Optional[str] = Hea
         return {"ok": True, "job": job_name, "updated": updated, "skipped_no_token": skipped_no_token}
 
     # -------------------------
-    # 3) FORECAST MACHINE (only where pm exists)
+    # FORECAST MACHINE
     # -------------------------
     if job_name == "forecast_machine":
+        t0 = time.time()
         updated = 0
         skipped_no_pm = 0
         with db() as conn:
-            rows = conn.execute("SELECT id, latest_pm_p FROM events").fetchall()
+            rows = conn.execute("SELECT id, latest_pm_p FROM events ORDER BY created_at DESC LIMIT ?", (PRICE_UPDATE_MAX,)).fetchall()
             for r in rows:
+                if time.time() - t0 > JOB_TIME_BUDGET_SECS:
+                    break
                 if r["latest_pm_p"] is None:
                     skipped_no_pm += 1
                     continue
@@ -439,14 +423,18 @@ def admin_run_job(job_name: str = Query(...), x_admin_token: Optional[str] = Hea
         return {"ok": True, "job": job_name, "updated": updated, "skipped_no_pm": skipped_no_pm}
 
     # -------------------------
-    # 4) UPDATE PRICES (SNAPSHOT + FORECAST)
+    # UPDATE PRICES (snapshot + forecast)
     # -------------------------
     if job_name == "update_prices":
+        t0 = time.time()
+
         snap = 0
         skipped_no_token = 0
         with db() as conn:
-            rows = conn.execute("SELECT id, yes_token_id FROM events").fetchall()
+            rows = conn.execute("SELECT id, yes_token_id FROM events ORDER BY created_at DESC LIMIT ?", (PRICE_UPDATE_MAX,)).fetchall()
             for r in rows:
+                if time.time() - t0 > JOB_TIME_BUDGET_SECS:
+                    break
                 if not r["yes_token_id"]:
                     skipped_no_token += 1
                     continue
@@ -461,11 +449,10 @@ def admin_run_job(job_name: str = Query(...), x_admin_token: Optional[str] = Hea
         fore = 0
         skipped_no_pm = 0
         with db() as conn:
-            rows = conn.execute("SELECT id, latest_pm_p FROM events").fetchall()
+            rows = conn.execute("SELECT id, latest_pm_p FROM events WHERE latest_pm_p IS NOT NULL ORDER BY created_at DESC LIMIT ?", (PRICE_UPDATE_MAX,)).fetchall()
             for r in rows:
-                if r["latest_pm_p"] is None:
-                    skipped_no_pm += 1
-                    continue
+                if time.time() - t0 > JOB_TIME_BUDGET_SECS:
+                    break
                 p_m = machine_from_pm(float(r["latest_pm_p"]))
                 conn.execute("UPDATE events SET latest_machine_p = ? WHERE id = ?", (p_m, r["id"]))
                 fore += 1
@@ -478,6 +465,7 @@ def admin_run_job(job_name: str = Query(...), x_admin_token: Optional[str] = Hea
             "forecast_updated": fore,
             "skipped_no_token": skipped_no_token,
             "skipped_no_pm": skipped_no_pm,
+            "time_secs": round(time.time() - t0, 3),
         }
 
     raise HTTPException(status_code=400, detail="Unhandled job")
