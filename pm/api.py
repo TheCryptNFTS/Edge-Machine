@@ -43,7 +43,7 @@ PRICE_UPDATE_MAX = int(os.getenv("PM_PRICE_UPDATE_MAX", "20")) # clob calls per 
 # APP
 # =========================
 
-app = FastAPI(title="Edge Machine API", version="1.1.0-hydrate")
+app = FastAPI(title="Edge Machine API", version="1.2.0-hydrate-fixed")
 
 app.add_middleware(
     CORSMiddleware,
@@ -193,22 +193,53 @@ def gamma_get_detail(mid: str) -> Optional[dict]:
     return None
 
 def extract_yes_token_id(m: dict) -> Optional[str]:
-    tokens = m.get("tokens") or m.get("outcomes") or []
-    if isinstance(tokens, list):
-        for t in tokens:
-            label = (t.get("outcome") or t.get("label") or t.get("name") or "").strip().lower()
-            if label == "yes":
-                for k in ("token_id", "tokenId", "tokenID", "id", "clobTokenId"):
-                    if t.get(k):
-                        return str(t.get(k))
+    """
+    Robust YES token extraction for Gamma schema variants.
 
-    clob_ids = m.get("clobTokenIds") or m.get("clob_token_ids")
-    if isinstance(clob_ids, list) and clob_ids:
-        return str(clob_ids[0])
+    Handles:
+      - tokens/outcomes as list[dict]
+      - outcomes as list[str] with clobTokenIds aligned by index
+      - root yesTokenId/yes_token_id
+      - binary fallback
+    """
 
-    for k in ("yesTokenId", "yes_token_id"):
+    # 0) Direct root fields
+    for k in ("yesTokenId", "yes_token_id", "yes_token", "yesToken"):
         if m.get(k):
             return str(m.get(k))
+
+    tokens_or_outcomes = m.get("tokens") or m.get("outcomes")
+
+    # 1) tokens/outcomes as list[dict]
+    if isinstance(tokens_or_outcomes, list) and tokens_or_outcomes and isinstance(tokens_or_outcomes[0], dict):
+        for t in tokens_or_outcomes:
+            label = (t.get("outcome") or t.get("label") or t.get("name") or "").strip().lower()
+            if label in ("yes", "true"):
+                for key in ("token_id", "tokenId", "tokenID", "id", "clobTokenId"):
+                    if t.get(key):
+                        return str(t.get(key))
+
+        clob_ids = m.get("clobTokenIds") or m.get("clob_token_ids")
+        if isinstance(clob_ids, list) and len(clob_ids) == len(tokens_or_outcomes):
+            for i, t in enumerate(tokens_or_outcomes):
+                label = (t.get("outcome") or t.get("label") or t.get("name") or "").strip().lower()
+                if label in ("yes", "true"):
+                    return str(clob_ids[i])
+
+        return None
+
+    # 2) outcomes as list[str] + clobTokenIds aligned by index
+    if isinstance(tokens_or_outcomes, list) and tokens_or_outcomes and isinstance(tokens_or_outcomes[0], str):
+        clob_ids = m.get("clobTokenIds") or m.get("clob_token_ids")
+        if isinstance(clob_ids, list) and len(clob_ids) == len(tokens_or_outcomes):
+            for i, name in enumerate(tokens_or_outcomes):
+                if str(name).strip().lower() in ("yes", "true"):
+                    return str(clob_ids[i])
+
+    # 3) last resort: binary fallback
+    clob_ids = m.get("clobTokenIds") or m.get("clob_token_ids")
+    if isinstance(clob_ids, list) and len(clob_ids) == 2:
+        return str(clob_ids[0])
 
     return None
 
@@ -227,7 +258,6 @@ def upsert_event(title: str, slug: Optional[str], gamma_market_id: Optional[str]
             row = conn.execute("SELECT id FROM events WHERE gamma_market_id = ?", (gamma_market_id,)).fetchone()
 
         if row:
-            # keep existing token if new is None
             if yes_token_id:
                 conn.execute(
                     "UPDATE events SET title=?, slug=?, gamma_market_id=?, yes_token_id=? WHERE id=?",
@@ -274,21 +304,6 @@ def list_events(limit: int = 50):
         for r in rows
     ]
 
-@app.post("/v1/admin/events", response_model=EventOut)
-def admin_create_event(payload: EventCreate, x_admin_token: Optional[str] = Header(None)):
-    check_admin(x_admin_token)
-    eid = str(uuid.uuid4())
-    now = datetime.now(timezone.utc).isoformat()
-    with db() as conn:
-        conn.execute(
-            """INSERT INTO events
-               (id, title, created_at, slug, gamma_market_id, yes_token_id, latest_pm_p, latest_machine_p)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (eid, payload.title.strip(), now, None, None, None, None, None)
-        )
-        conn.commit()
-    return EventOut(id=eid, title=payload.title.strip())
-
 @app.post("/v1/admin/jobs/run")
 def admin_run_job(job_name: str = Query(...), x_admin_token: Optional[str] = Header(None)):
     check_admin(x_admin_token)
@@ -302,7 +317,6 @@ def admin_run_job(job_name: str = Query(...), x_admin_token: Optional[str] = Hea
     if job_name == "discover_markets":
         t0 = time.time()
         keywords = [k.strip().lower() for k in DISCOVER_KEYWORDS.split(",") if k.strip()]
-
         markets = gamma_get_markets(limit=100, offset=0)
 
         candidates: list[tuple[float, dict]] = []
@@ -317,7 +331,6 @@ def admin_run_job(job_name: str = Query(...), x_admin_token: Optional[str] = Hea
             tl = title.lower()
             if not any(k in tl for k in keywords):
                 continue
-
             vol = fnum(m.get("volume") or m.get("volume24h") or m.get("volume_24hr") or 0)
             liq = fnum(m.get("liquidity") or 0)
             score = vol + (0.1 * liq)
@@ -340,10 +353,7 @@ def admin_run_job(job_name: str = Query(...), x_admin_token: Optional[str] = Hea
             if not gamma_market_id:
                 continue
 
-            # try fast token extraction first
             yes_tid = extract_yes_token_id(m)
-
-            # limited detail calls
             if not yes_tid and detail_calls < DISCOVER_DETAIL_MAX:
                 detail = gamma_get_detail(gamma_market_id)
                 detail_calls += 1
@@ -351,7 +361,6 @@ def admin_run_job(job_name: str = Query(...), x_admin_token: Optional[str] = Hea
                     yes_tid = extract_yes_token_id(detail)
 
             upsert_event(title=title, slug=slug, gamma_market_id=gamma_market_id, yes_token_id=yes_tid)
-
             used += 1
             if yes_tid:
                 tokened += 1
@@ -366,7 +375,7 @@ def admin_run_job(job_name: str = Query(...), x_admin_token: Optional[str] = Hea
         }
 
     # -------------------------
-    # HYDRATE TOKENS (THIS IS THE MISSING PIECE)
+    # HYDRATE TOKENS
     # -------------------------
     if job_name == "hydrate_tokens":
         t0 = time.time()
@@ -398,28 +407,18 @@ def admin_run_job(job_name: str = Query(...), x_admin_token: Optional[str] = Hea
                 if not yes_tid:
                     continue
 
-                conn.execute(
-                    "UPDATE events SET yes_token_id=? WHERE id=?",
-                    (yes_tid, r["id"])
-                )
+                conn.execute("UPDATE events SET yes_token_id=? WHERE id=?", (yes_tid, r["id"]))
                 hydrated += 1
 
             conn.commit()
 
-        return {
-            "ok": True,
-            "job": job_name,
-            "attempted": attempted,
-            "hydrated": hydrated,
-            "time_secs": round(time.time() - t0, 3),
-        }
+        return {"ok": True, "job": job_name, "attempted": attempted, "hydrated": hydrated, "time_secs": round(time.time() - t0, 3)}
 
     # -------------------------
-    # UPDATE PRICES (needs yes_token_id)
+    # UPDATE PRICES
     # -------------------------
     if job_name == "update_prices":
         t0 = time.time()
-
         snap = 0
         fore = 0
         skipped_no_token = 0
