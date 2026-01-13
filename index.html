@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
+  <meta charset="utf-8" />
   <title>Edge Machine</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <script src="https://cdn.tailwindcss.com"></script>
@@ -9,14 +9,18 @@
 
 <body class="bg-gray-950 text-gray-100 min-h-screen font-sans">
   <div class="max-w-5xl mx-auto px-4 py-8">
+
     <div class="flex items-center justify-between mb-8">
       <h1 class="text-3xl font-bold">Edge Machine</h1>
-      <button id="refresh" class="px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded transition">
+      <button id="refresh"
+        class="px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded transition">
         Refresh
       </button>
     </div>
 
-    <div id="status" class="mb-6 text-lg font-medium">Loading markets...</div>
+    <div id="status" class="mb-6 text-lg font-medium">
+      Loading…
+    </div>
 
     <div class="overflow-x-auto">
       <table class="w-full text-sm border-collapse">
@@ -33,69 +37,72 @@
     </div>
 
     <div id="error" class="mt-6 text-red-400 hidden"></div>
+
   </div>
 
-  <script>
-    // ✅ Your live Railway backend
-    const API = "https://edge-machine-production.up.railway.app";
+<script>
+  // ✅ LIVE RAILWAY API
+  const API = "https://edge-machine-production.up.railway.app";
 
-    async function load() {
-      const status = document.getElementById("status");
-      const table = document.getElementById("table");
-      const error = document.getElementById("error");
+  async function load() {
+    const status = document.getElementById("status");
+    const table = document.getElementById("table");
+    const error = document.getElementById("error");
 
-      error.classList.add("hidden");
-      error.textContent = "";
-      status.textContent = "Loading...";
-      table.innerHTML = "";
+    error.classList.add("hidden");
+    table.innerHTML = "";
+    status.textContent = "Loading markets…";
 
-      try {
-        const r = await fetch(API + "/v1/events?limit=50", { cache: "no-store" });
-        if (!r.ok) throw new Error("API error: " + r.status);
-        const data = await r.json();
+    try {
+      const res = await fetch(API + "/v1/events?limit=10");
+      if (!res.ok) throw new Error("API error " + res.status);
 
-        if (!data.length) {
-          status.textContent = "No markets yet — bootstrap needed";
-          return;
-        }
+      const data = await res.json();
 
-        data.forEach(e => {
-          const crowdNum = (typeof e.latest_pm_p === "number") ? e.latest_pm_p : null;
-          const machNum  = (typeof e.latest_machine_p === "number") ? e.latest_machine_p : null;
-
-          const crowd = (crowdNum !== null) ? (crowdNum * 100).toFixed(1) + "%" : "—";
-          const machine = (machNum !== null) ? (machNum * 100).toFixed(1) + "%" : "—";
-
-          let signal = "—";
-          let color = "text-gray-400";
-
-          if (crowdNum !== null && machNum !== null) {
-            signal = (crowdNum > machNum) ? "FADE YES" : "RIDE YES";
-            color = (crowdNum > machNum) ? "text-red-400" : "text-emerald-400";
-          }
-
-          const row = document.createElement("tr");
-          row.className = "border-b border-gray-800";
-          row.innerHTML = `
-            <td class="p-3">${e.title}</td>
-            <td class="p-3">${crowd}</td>
-            <td class="p-3">${machine}</td>
-            <td class="p-3 font-bold ${color}">${signal}</td>
-          `;
-          table.appendChild(row);
-        });
-
-        status.textContent = "Live";
-      } catch (e) {
-        status.textContent = "Error connecting";
-        error.textContent = e.message;
-        error.classList.remove("hidden");
+      if (!data.length) {
+        status.textContent = "No events yet — backend alive, waiting for bootstrap";
+        return;
       }
-    }
 
-    document.getElementById("refresh").onclick = load;
-    load();
-    setInterval(load, 30000);
-  </script>
+      data.forEach(e => {
+        const crowd = e.latest_pm_p != null
+          ? (e.latest_pm_p * 100).toFixed(1) + "%"
+          : "—";
+
+        const machine = e.latest_machine_p != null
+          ? (e.latest_machine_p * 100).toFixed(1) + "%"
+          : "—";
+
+        const fade = e.latest_pm_p != null && e.latest_machine_p != null
+          && e.latest_pm_p > e.latest_machine_p;
+
+        const signal = fade ? "FADE YES" : "RIDE YES";
+        const color = fade ? "text-red-400" : "text-emerald-400";
+
+        const row = document.createElement("tr");
+        row.className = "border-b border-gray-800";
+        row.innerHTML = `
+          <td class="p-3">${e.title}</td>
+          <td class="p-3">${crowd}</td>
+          <td class="p-3">${machine}</td>
+          <td class="p-3 font-bold ${color}">${signal}</td>
+        `;
+        table.appendChild(row);
+      });
+
+      status.textContent = "Live";
+
+    } catch (err) {
+      status.textContent = "Error connecting";
+      error.textContent = err.message;
+      error.classList.remove("hidden");
+    }
+  }
+
+  document.getElementById("refresh").onclick = load;
+  load();
+  setInterval(load, 30000);
+</script>
+
 </body>
 </html>
