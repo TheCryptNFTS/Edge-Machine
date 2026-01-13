@@ -21,27 +21,26 @@ from pydantic import BaseModel
 DATABASE_URL = os.getenv("PM_DATABASE_URL", "sqlite:///./pm.db")
 DB_PATH = DATABASE_URL.replace("sqlite:///", "")
 
-ADMIN_TOKEN = os.getenv("PM_ADMIN_TOKEN", os.getenv("ADMIN_TOKEN", "change-me"))
+# Admin token: set PM_ADMIN_TOKEN in Railway
+ADMIN_TOKEN = os.getenv("PM_ADMIN_TOKEN") or os.getenv("ADMIN_TOKEN") or "change-me"
 
 GAMMA_BASE = os.getenv("PM_GAMMA_BASE", "https://gamma-api.polymarket.com").rstrip("/")
 CLOB_BASE = os.getenv("PM_CLOB_BASE", "https://clob.polymarket.com").rstrip("/")
 
 # Discover settings
 DISCOVER_LIMIT = int(os.getenv("PM_DISCOVER_LIMIT", "50"))
-DISCOVER_PAGES = int(os.getenv("PM_DISCOVER_PAGES", "5"))          # pulls 5 pages by default
-DISCOVER_PAGE_SIZE = int(os.getenv("PM_DISCOVER_PAGE_SIZE", "100"))# 100 per page
+DISCOVER_PAGES = int(os.getenv("PM_DISCOVER_PAGES", "5"))
+DISCOVER_PAGE_SIZE = int(os.getenv("PM_DISCOVER_PAGE_SIZE", "100"))
 DISCOVER_KEYWORDS = os.getenv(
     "PM_DISCOVER_KEYWORDS",
     "bitcoin,btc,ethereum,eth,sol,solana,crypto,memecoin,doge,ai,trump,election,fed,inflation,rate"
 )
-
-# If true: only markets containing keywords are kept. If false: keep all active markets.
 STRICT_KEYWORDS = os.getenv("PM_STRICT_KEYWORDS", "false").lower() == "true"
 
-# Time budget per job (prevents Railway timeout)
-JOB_TIME_BUDGET_SECS = int(os.getenv("PM_JOB_TIME_BUDGET_SECS", "10"))
+# Time budget per job
+JOB_TIME_BUDGET_SECS = int(os.getenv("PM_JOB_TIME_BUDGET_SECS", "12"))
 
-# How many detail fetches to allow per discover run
+# Detail calls (Gamma /markets/{id})
 DISCOVER_DETAIL_MAX = int(os.getenv("PM_DISCOVER_DETAIL_MAX", "25"))
 
 # Hydrate tokens per run
@@ -54,7 +53,7 @@ PRICE_UPDATE_MAX = int(os.getenv("PM_PRICE_UPDATE_MAX", "50"))
 # APP
 # =========================
 
-app = FastAPI(title="Edge Machine API", version="1.3.0-discover-fixed")
+app = FastAPI(title="Edge Machine API", version="1.4.0-priceable-discover")
 
 app.add_middleware(
     CORSMiddleware,
@@ -65,7 +64,7 @@ app.add_middleware(
 )
 
 # =========================
-# DB HELPERS (safe)
+# DB HELPERS
 # =========================
 
 def get_conn():
@@ -137,7 +136,11 @@ def clamp01(x: float) -> float:
         v = float(x)
     except Exception:
         return 0.5
-    return 0.0 if v < 0 else 1.0 if v > 1 else v
+    if v < 0.0:
+        return 0.0
+    if v > 1.0:
+        return 1.0
+    return v
 
 def fnum(x) -> float:
     try:
@@ -146,7 +149,7 @@ def fnum(x) -> float:
         return 0.0
 
 def machine_from_pm(p_pm: float) -> float:
-    # lightweight conservative machine (replace later with your v0.2 logic)
+    # lightweight conservative machine (replace with v0.2 later)
     p = 0.90 * p_pm + 0.10 * 0.5
     if p_pm >= 0.94:
         p = min(p, 0.995)
@@ -169,6 +172,7 @@ def clob_midpoint(token_id: str) -> Optional[float]:
                 r = requests.get(url, params=params, timeout=8)
                 r.raise_for_status()
                 data = r.json()
+
                 mp = data.get("midpoint") or data.get("price")
                 if mp is None and isinstance(data.get("data"), dict):
                     mp = data["data"].get("midpoint") or data["data"].get("price")
@@ -202,8 +206,20 @@ def gamma_get_detail(mid: str) -> Optional[dict]:
             pass
     return None
 
+def has_any_token_hint(m: dict) -> bool:
+    # market list payload has token hints (so it's likely priceable)
+    if m.get("yesTokenId") or m.get("yes_token_id"):
+        return True
+
+    clob_ids = m.get("clobTokenIds") or m.get("clob_token_ids")
+    if isinstance(clob_ids, list) and len(clob_ids) >= 1:
+        return True
+
+    toks = m.get("tokens") or m.get("outcomes")
+    return isinstance(toks, list) and len(toks) > 0
+
 def extract_yes_token_id(m: dict) -> Optional[str]:
-    # Prefer tokens/outcomes list with label "Yes"
+    # Prefer explicit YES label in tokens/outcomes
     tokens = m.get("tokens") or m.get("outcomes") or []
     if isinstance(tokens, list):
         for t in tokens:
@@ -213,19 +229,20 @@ def extract_yes_token_id(m: dict) -> Optional[str]:
                     if t.get(k):
                         return str(t.get(k))
 
-    # If binary list exists but labels missing, do NOT guess unless exactly 2 and you accept risk.
-    clob_ids = m.get("clobTokenIds") or m.get("clob_token_ids")
-    if isinstance(clob_ids, list) and len(clob_ids) == 2:
-        # risky fallback; better than nothing for many gamma payloads
-        return str(clob_ids[0])
-
+    # Fallback: yesTokenId fields
     for k in ("yesTokenId", "yes_token_id"):
         if m.get(k):
             return str(m.get(k))
 
+    # Fallback: clobTokenIds[0] (best-effort; some markets may be flipped)
+    clob_ids = m.get("clobTokenIds") or m.get("clob_token_ids")
+    if isinstance(clob_ids, list) and len(clob_ids) >= 1:
+        return str(clob_ids[0])
+
     return None
 
 def is_current(m: dict) -> bool:
+    # only accept active markets
     if "active" in m and m.get("active") is False:
         return False
     return True
@@ -309,19 +326,20 @@ def admin_run_job(job_name: str = Query(...), x_admin_token: Optional[str] = Hea
     t0 = time.time()
 
     # -------------------------
-    # DISCOVER MARKETS
+    # DISCOVER MARKETS (priceable only)
     # -------------------------
     if job_name == "discover_markets":
         keywords = [k.strip().lower() for k in DISCOVER_KEYWORDS.split(",") if k.strip()]
 
-        # Pull multiple pages
         markets: list[dict] = []
+        pages_pulled = 0
         for page in range(DISCOVER_PAGES):
             if time.time() - t0 > JOB_TIME_BUDGET_SECS:
                 break
             offset = page * DISCOVER_PAGE_SIZE
             try:
                 markets.extend(gamma_get_markets(limit=DISCOVER_PAGE_SIZE, offset=offset))
+                pages_pulled += 1
             except Exception:
                 break
 
@@ -335,9 +353,10 @@ def admin_run_job(job_name: str = Query(...), x_admin_token: Optional[str] = Hea
             if not is_current(m):
                 continue
 
-            tl = title.lower()
+            if not has_any_token_hint(m):
+                continue
 
-            # keyword filter is now optional (fixes discovered=0)
+            tl = title.lower()
             if STRICT_KEYWORDS and keywords and not any(k in tl for k in keywords):
                 continue
 
@@ -373,7 +392,6 @@ def admin_run_job(job_name: str = Query(...), x_admin_token: Optional[str] = Hea
                         yes_tid = extract_yes_token_id(detail)
 
                 upsert_event(conn, title=title, slug=slug, gamma_market_id=gamma_market_id, yes_token_id=yes_tid)
-
                 used += 1
                 if yes_tid:
                     tokened += 1
@@ -386,7 +404,7 @@ def admin_run_job(job_name: str = Query(...), x_admin_token: Optional[str] = Hea
             "discovered": used,
             "tokened": tokened,
             "detail_calls": detail_calls,
-            "pages_pulled": len(markets) // max(1, DISCOVER_PAGE_SIZE),
+            "pages_pulled": pages_pulled,
             "strict_keywords": STRICT_KEYWORDS,
             "time_secs": round(time.time() - t0, 3),
         }
@@ -412,13 +430,12 @@ def admin_run_job(job_name: str = Query(...), x_admin_token: Optional[str] = Hea
             for r in rows:
                 if time.time() - t0 > JOB_TIME_BUDGET_SECS:
                     break
-
                 attempted += 1
                 mid = r["gamma_market_id"]
+
                 detail = gamma_get_detail(mid)
                 if not detail:
                     continue
-
                 yes_tid = extract_yes_token_id(detail)
                 if not yes_tid:
                     continue
@@ -459,9 +476,11 @@ def admin_run_job(job_name: str = Query(...), x_admin_token: Optional[str] = Hea
                 if not r["yes_token_id"]:
                     skipped_no_token += 1
                     continue
+
                 p = clob_midpoint(r["yes_token_id"])
                 if p is None:
                     continue
+
                 p = clamp01(p)
                 conn.execute("UPDATE events SET latest_pm_p=? WHERE id=?", (p, r["id"]))
                 snap += 1
