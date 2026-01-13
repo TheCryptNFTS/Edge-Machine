@@ -36,17 +36,18 @@ DISCOVER_KEYWORDS = os.getenv(
 # ---- timeout-safe knobs ----
 JOB_TIME_BUDGET_SECS = int(os.getenv("PM_JOB_TIME_BUDGET_SECS", "8"))
 DISCOVER_DETAIL_MAX = int(os.getenv("PM_DISCOVER_DETAIL_MAX", "10"))
-PRICE_UPDATE_MAX = int(os.getenv("PM_PRICE_UPDATE_MAX", "20"))
+HYDRATE_MAX = int(os.getenv("PM_HYDRATE_MAX", "15"))          # token lookups per run
+PRICE_UPDATE_MAX = int(os.getenv("PM_PRICE_UPDATE_MAX", "20")) # clob calls per run
 
 # =========================
 # APP
 # =========================
 
-app = FastAPI(title="Edge Machine API", version="1.0.0-timebudget")
+app = FastAPI(title="Edge Machine API", version="1.1.0-hydrate")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # ok for now; lock down later
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -79,7 +80,6 @@ def init_db():
             latest_machine_p REAL
         )
         """)
-        # safe migrations
         for col, ddl in [
             ("slug", "ALTER TABLE events ADD COLUMN slug TEXT"),
             ("gamma_market_id", "ALTER TABLE events ADD COLUMN gamma_market_id TEXT"),
@@ -137,7 +137,6 @@ def fnum(x) -> float:
         return 0.0
 
 def machine_from_pm(p_pm: float) -> float:
-    # Minimal stable machine (swap for full v0.2 later)
     p = 0.90 * p_pm + 0.10 * 0.5
     if p_pm >= 0.94:
         p = min(p, 0.995)
@@ -216,7 +215,6 @@ def extract_yes_token_id(m: dict) -> Optional[str]:
 def is_current(m: dict) -> bool:
     if "active" in m and m.get("active") is False:
         return False
-    # permissive otherwise
     return True
 
 def upsert_event(title: str, slug: Optional[str], gamma_market_id: Optional[str], yes_token_id: Optional[str]) -> None:
@@ -227,23 +225,17 @@ def upsert_event(title: str, slug: Optional[str], gamma_market_id: Optional[str]
             row = conn.execute("SELECT id FROM events WHERE slug = ?", (slug,)).fetchone()
         if not row and gamma_market_id:
             row = conn.execute("SELECT id FROM events WHERE gamma_market_id = ?", (gamma_market_id,)).fetchone()
-        if not row and yes_token_id:
-            row = conn.execute("SELECT id FROM events WHERE yes_token_id = ?", (yes_token_id,)).fetchone()
 
         if row:
-            # Don't wipe token if new is None
+            # keep existing token if new is None
             if yes_token_id:
                 conn.execute(
-                    """UPDATE events
-                       SET title=?, slug=?, gamma_market_id=?, yes_token_id=?
-                       WHERE id=?""",
+                    "UPDATE events SET title=?, slug=?, gamma_market_id=?, yes_token_id=? WHERE id=?",
                     (title, slug, gamma_market_id, yes_token_id, row["id"])
                 )
             else:
                 conn.execute(
-                    """UPDATE events
-                       SET title=?, slug=?, gamma_market_id=?
-                       WHERE id=?""",
+                    "UPDATE events SET title=?, slug=?, gamma_market_id=? WHERE id=?",
                     (title, slug, gamma_market_id, row["id"])
                 )
         else:
@@ -254,6 +246,7 @@ def upsert_event(title: str, slug: Optional[str], gamma_market_id: Optional[str]
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (eid, title, now, slug, gamma_market_id, yes_token_id, None, None)
             )
+
         conn.commit()
 
 # =========================
@@ -300,11 +293,11 @@ def admin_create_event(payload: EventCreate, x_admin_token: Optional[str] = Head
 def admin_run_job(job_name: str = Query(...), x_admin_token: Optional[str] = Header(None)):
     check_admin(x_admin_token)
 
-    if job_name not in {"discover_markets", "snapshot_pm", "forecast_machine", "update_prices"}:
+    if job_name not in {"discover_markets", "hydrate_tokens", "update_prices"}:
         raise HTTPException(status_code=400, detail="Unknown job")
 
     # -------------------------
-    # DISCOVER MARKETS (FAST / NO TIMEOUT)
+    # DISCOVER MARKETS
     # -------------------------
     if job_name == "discover_markets":
         t0 = time.time()
@@ -312,7 +305,6 @@ def admin_run_job(job_name: str = Query(...), x_admin_token: Optional[str] = Hea
 
         markets = gamma_get_markets(limit=100, offset=0)
 
-        # filter by keywords and sort by volume/liquidity
         candidates: list[tuple[float, dict]] = []
         for m in markets:
             if time.time() - t0 > JOB_TIME_BUDGET_SECS:
@@ -348,22 +340,18 @@ def admin_run_job(job_name: str = Query(...), x_admin_token: Optional[str] = Hea
             if not gamma_market_id:
                 continue
 
-            # fast attempt from list payload
+            # try fast token extraction first
             yes_tid = extract_yes_token_id(m)
 
-            # slow detail attempts limited
+            # limited detail calls
             if not yes_tid and detail_calls < DISCOVER_DETAIL_MAX:
                 detail = gamma_get_detail(gamma_market_id)
                 detail_calls += 1
                 if detail:
                     yes_tid = extract_yes_token_id(detail)
 
-            upsert_event(
-                title=title,
-                slug=slug,
-                gamma_market_id=gamma_market_id,
-                yes_token_id=yes_tid
-            )
+            upsert_event(title=title, slug=slug, gamma_market_id=gamma_market_id, yes_token_id=yes_tid)
+
             used += 1
             if yes_tid:
                 tokened += 1
@@ -378,60 +366,74 @@ def admin_run_job(job_name: str = Query(...), x_admin_token: Optional[str] = Hea
         }
 
     # -------------------------
-    # SNAPSHOT PM PRICES
+    # HYDRATE TOKENS (THIS IS THE MISSING PIECE)
     # -------------------------
-    if job_name == "snapshot_pm":
+    if job_name == "hydrate_tokens":
         t0 = time.time()
-        updated = 0
-        skipped_no_token = 0
+        hydrated = 0
+        attempted = 0
+
         with db() as conn:
-            rows = conn.execute("SELECT id, yes_token_id FROM events ORDER BY created_at DESC LIMIT ?", (PRICE_UPDATE_MAX,)).fetchall()
+            rows = conn.execute(
+                """SELECT id, gamma_market_id
+                   FROM events
+                   WHERE (yes_token_id IS NULL OR yes_token_id = '')
+                     AND gamma_market_id IS NOT NULL
+                   ORDER BY created_at DESC
+                   LIMIT ?""",
+                (HYDRATE_MAX,)
+            ).fetchall()
+
             for r in rows:
                 if time.time() - t0 > JOB_TIME_BUDGET_SECS:
                     break
-                if not r["yes_token_id"]:
-                    skipped_no_token += 1
+
+                attempted += 1
+                mid = r["gamma_market_id"]
+                detail = gamma_get_detail(mid)
+                if not detail:
                     continue
-                p = clob_midpoint(r["yes_token_id"])
-                if p is None:
+
+                yes_tid = extract_yes_token_id(detail)
+                if not yes_tid:
                     continue
-                p = clamp01(p)
-                conn.execute("UPDATE events SET latest_pm_p = ? WHERE id = ?", (p, r["id"]))
-                updated += 1
+
+                conn.execute(
+                    "UPDATE events SET yes_token_id=? WHERE id=?",
+                    (yes_tid, r["id"])
+                )
+                hydrated += 1
+
             conn.commit()
-        return {"ok": True, "job": job_name, "updated": updated, "skipped_no_token": skipped_no_token}
+
+        return {
+            "ok": True,
+            "job": job_name,
+            "attempted": attempted,
+            "hydrated": hydrated,
+            "time_secs": round(time.time() - t0, 3),
+        }
 
     # -------------------------
-    # FORECAST MACHINE
-    # -------------------------
-    if job_name == "forecast_machine":
-        t0 = time.time()
-        updated = 0
-        skipped_no_pm = 0
-        with db() as conn:
-            rows = conn.execute("SELECT id, latest_pm_p FROM events ORDER BY created_at DESC LIMIT ?", (PRICE_UPDATE_MAX,)).fetchall()
-            for r in rows:
-                if time.time() - t0 > JOB_TIME_BUDGET_SECS:
-                    break
-                if r["latest_pm_p"] is None:
-                    skipped_no_pm += 1
-                    continue
-                p_m = machine_from_pm(float(r["latest_pm_p"]))
-                conn.execute("UPDATE events SET latest_machine_p = ? WHERE id = ?", (p_m, r["id"]))
-                updated += 1
-            conn.commit()
-        return {"ok": True, "job": job_name, "updated": updated, "skipped_no_pm": skipped_no_pm}
-
-    # -------------------------
-    # UPDATE PRICES (snapshot + forecast)
+    # UPDATE PRICES (needs yes_token_id)
     # -------------------------
     if job_name == "update_prices":
         t0 = time.time()
 
         snap = 0
+        fore = 0
         skipped_no_token = 0
+        skipped_no_pm = 0
+
         with db() as conn:
-            rows = conn.execute("SELECT id, yes_token_id FROM events ORDER BY created_at DESC LIMIT ?", (PRICE_UPDATE_MAX,)).fetchall()
+            rows = conn.execute(
+                """SELECT id, yes_token_id
+                   FROM events
+                   ORDER BY created_at DESC
+                   LIMIT ?""",
+                (PRICE_UPDATE_MAX,)
+            ).fetchall()
+
             for r in rows:
                 if time.time() - t0 > JOB_TIME_BUDGET_SECS:
                     break
@@ -442,20 +444,28 @@ def admin_run_job(job_name: str = Query(...), x_admin_token: Optional[str] = Hea
                 if p is None:
                     continue
                 p = clamp01(p)
-                conn.execute("UPDATE events SET latest_pm_p = ? WHERE id = ?", (p, r["id"]))
+                conn.execute("UPDATE events SET latest_pm_p=? WHERE id=?", (p, r["id"]))
                 snap += 1
+
             conn.commit()
 
-        fore = 0
-        skipped_no_pm = 0
         with db() as conn:
-            rows = conn.execute("SELECT id, latest_pm_p FROM events WHERE latest_pm_p IS NOT NULL ORDER BY created_at DESC LIMIT ?", (PRICE_UPDATE_MAX,)).fetchall()
+            rows = conn.execute(
+                """SELECT id, latest_pm_p
+                   FROM events
+                   WHERE latest_pm_p IS NOT NULL
+                   ORDER BY created_at DESC
+                   LIMIT ?""",
+                (PRICE_UPDATE_MAX,)
+            ).fetchall()
+
             for r in rows:
                 if time.time() - t0 > JOB_TIME_BUDGET_SECS:
                     break
                 p_m = machine_from_pm(float(r["latest_pm_p"]))
-                conn.execute("UPDATE events SET latest_machine_p = ? WHERE id = ?", (p_m, r["id"]))
+                conn.execute("UPDATE events SET latest_machine_p=? WHERE id=?", (p_m, r["id"]))
                 fore += 1
+
             conn.commit()
 
         return {
