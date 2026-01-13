@@ -6,7 +6,6 @@ set -euo pipefail
 : "${JOB_NAME:?Need JOB_NAME}"
 
 curl -sS -X POST \
-  "${PM_API_BASE}/v1/admin/jobs/run?job_name=${JOB_NAME}" \
-  -H "x-admin-token: ${PM_ADMIN_TOKEN}"
-
+  -H "x-admin-token: ${PM_ADMIN_TOKEN}" \
+  "${PM_API_BASE}/v1/admin/jobs/run?job_name=${JOB_NAME}"
 echo
