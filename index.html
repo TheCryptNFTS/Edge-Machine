@@ -43,13 +43,13 @@
       const status = document.getElementById("status");
       const table = document.getElementById("table");
       const error = document.getElementById("error");
-      error.classList.add("hidden");
 
+      error.classList.add("hidden");
+      error.textContent = "";
       status.textContent = "Loading...";
       table.innerHTML = "";
 
       try {
-        // Pull more than 5 so you see something after bootstraps
         const r = await fetch(API + "/v1/events?limit=50", { cache: "no-store" });
         if (!r.ok) throw new Error("API error: " + r.status);
         const data = await r.json();
@@ -66,9 +66,9 @@
           const crowd = (crowdNum !== null) ? (crowdNum * 100).toFixed(1) + "%" : "—";
           const machine = (machNum !== null) ? (machNum * 100).toFixed(1) + "%" : "—";
 
-          // Only show signal if both exist
           let signal = "—";
           let color = "text-gray-400";
+
           if (crowdNum !== null && machNum !== null) {
             signal = (crowdNum > machNum) ? "FADE YES" : "RIDE YES";
             color = (crowdNum > machNum) ? "text-red-400" : "text-emerald-400";
