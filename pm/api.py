@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException, Header, Query
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
@@ -18,20 +18,17 @@ import time
 DATABASE_URL = os.getenv("PM_DATABASE_URL", "sqlite:///./pm.db")
 DB_PATH = DATABASE_URL.replace("sqlite:///", "")
 
-# Admin token accepts either env var name
 ADMIN_TOKEN = (
     os.getenv("ADMIN_TOKEN")
     or os.getenv("PM_ADMIN_TOKEN")
     or "change-me"
 )
 
-# Polymarket endpoints
 GAMMA_BASE = os.getenv("PM_GAMMA_BASE", "https://gamma-api.polymarket.com").rstrip("/")
 CLOB_BASE = os.getenv("PM_CLOB_BASE", "https://clob.polymarket.com").rstrip("/")
 
-# Discovery tuning
 DISCOVER_LIMIT = int(os.getenv("PM_DISCOVER_LIMIT", "50"))
-DISCOVER_PAGES = int(os.getenv("PM_DISCOVER_PAGES", "5"))  # each page ~100 markets
+DISCOVER_PAGES = int(os.getenv("PM_DISCOVER_PAGES", "5"))
 DISCOVER_KEYWORDS = os.getenv(
     "PM_DISCOVER_KEYWORDS",
     "bitcoin,btc,ethereum,eth,sol,solana,crypto,memecoin,doge,ai,trump,election,fed,inflation,rate"
@@ -41,19 +38,18 @@ DISCOVER_KEYWORDS = os.getenv(
 # APP
 # =========================
 
-app = FastAPI(title="Edge Machine API", version="0.7.0")
+app = FastAPI(title="Edge Machine API", version="0.8.0")
 
-# Allow Vercel frontend to fetch freely (lock down later)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # ok for now; lock down later
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # =========================
-# DB HELPERS
+# DB
 # =========================
 
 def db():
@@ -79,7 +75,7 @@ def init_db():
             latest_machine_p REAL
         )
         """)
-        # migrations (safe)
+        # safe migrations
         for col, ddl in [
             ("slug", "ALTER TABLE events ADD COLUMN slug TEXT"),
             ("gamma_market_id", "ALTER TABLE events ADD COLUMN gamma_market_id TEXT"),
@@ -138,11 +134,8 @@ def fnum(x) -> float:
 
 def machine_from_pm(p_pm: float) -> float:
     """
-    Minimal machine until you plug full v0.2 ensemble back in.
-    Stable + safe:
-    - mostly rides PM
-    - tiny shrink to 0.5
-    - mild cap/floor at extremes
+    Minimal machine until you re-plug your v0.2 ensemble.
+    Stable & safe.
     """
     p = 0.90 * p_pm + 0.10 * 0.5
     if p_pm >= 0.94:
@@ -191,45 +184,67 @@ def gamma_get_markets(limit: int = 100, offset: int = 0) -> list[dict]:
 
 def extract_yes_token_id(m: dict) -> Optional[str]:
     """
-    Best-effort YES token extraction:
-    - binary markets usually have tokens/outcomes where label==YES
-    - some provide clobTokenIds (yes first)
+    Best-effort YES token extraction.
+    We DO NOT fail discovery if this returns None anymore.
     """
     tokens = m.get("tokens") or m.get("outcomes") or []
     if isinstance(tokens, list):
         for t in tokens:
             label = (t.get("outcome") or t.get("label") or t.get("name") or "").strip().lower()
+            # common "yes"
             if label == "yes":
                 for k in ("token_id", "tokenId", "tokenID", "id", "clobTokenId"):
                     if t.get(k):
                         return str(t.get(k))
 
+    # fallback: clob token ids (binary markets often yes first)
     clob_ids = m.get("clobTokenIds") or m.get("clob_token_ids")
     if isinstance(clob_ids, list) and clob_ids:
         return str(clob_ids[0])
 
+    # fallback: root keys
     for k in ("yesTokenId", "yes_token_id"):
         if m.get(k):
             return str(m.get(k))
 
     return None
 
-def upsert_event(title: str, slug: Optional[str], gamma_market_id: Optional[str], yes_token_id: str) -> None:
+def upsert_event(
+    title: str,
+    slug: Optional[str],
+    gamma_market_id: Optional[str],
+    yes_token_id: Optional[str],
+) -> None:
     now = datetime.now(timezone.utc).isoformat()
     with db() as conn:
         row = None
         if slug:
             row = conn.execute("SELECT id FROM events WHERE slug = ?", (slug,)).fetchone()
-        if not row:
+
+        # if no slug match, try gamma_market_id
+        if not row and gamma_market_id:
+            row = conn.execute("SELECT id FROM events WHERE gamma_market_id = ?", (gamma_market_id,)).fetchone()
+
+        # if no match and we have a token, match by token too
+        if not row and yes_token_id:
             row = conn.execute("SELECT id FROM events WHERE yes_token_id = ?", (yes_token_id,)).fetchone()
 
         if row:
-            conn.execute(
-                """UPDATE events
-                   SET title=?, slug=?, gamma_market_id=?, yes_token_id=?
-                   WHERE id=?""",
-                (title, slug, gamma_market_id, yes_token_id, row["id"])
-            )
+            # Do not wipe existing token if new is None
+            if yes_token_id:
+                conn.execute(
+                    """UPDATE events
+                       SET title=?, slug=?, gamma_market_id=?, yes_token_id=?
+                       WHERE id=?""",
+                    (title, slug, gamma_market_id, yes_token_id, row["id"])
+                )
+            else:
+                conn.execute(
+                    """UPDATE events
+                       SET title=?, slug=?, gamma_market_id=?
+                       WHERE id=?""",
+                    (title, slug, gamma_market_id, row["id"])
+                )
         else:
             eid = str(uuid.uuid4())
             conn.execute(
@@ -238,6 +253,7 @@ def upsert_event(title: str, slug: Optional[str], gamma_market_id: Optional[str]
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (eid, title, now, slug, gamma_market_id, yes_token_id, None, None)
             )
+
         conn.commit()
 
 # =========================
@@ -288,7 +304,7 @@ def admin_run_job(job_name: str, x_admin_token: Optional[str] = Header(None)):
         raise HTTPException(status_code=400, detail="Unknown job")
 
     # -------------------------
-    # 1) DISCOVER REAL POLYMARKET MARKETS
+    # 1) DISCOVER MARKETS (REAL)
     # -------------------------
     if job_name == "discover_markets":
         keywords = [k.strip().lower() for k in DISCOVER_KEYWORDS.split(",") if k.strip()]
@@ -304,11 +320,11 @@ def admin_run_job(job_name: str, x_admin_token: Optional[str] = Header(None)):
                 title = (m.get("question") or m.get("title") or "").strip()
                 if not title:
                     continue
+
                 tl = title.lower()
                 if not any(k in tl for k in keywords):
                     continue
 
-                # Score by volume/liquidity
                 vol = fnum(m.get("volume") or m.get("volume24h") or m.get("volume_24hr") or 0)
                 liq = fnum(m.get("liquidity") or 0)
                 score = vol + (0.1 * liq)
@@ -324,27 +340,34 @@ def admin_run_job(job_name: str, x_admin_token: Optional[str] = Header(None)):
             title = (m.get("question") or m.get("title") or "").strip()
             slug = m.get("slug")
             mid = m.get("id") or m.get("marketId") or m.get("market_id")
-            yes_tid = extract_yes_token_id(m)
-            if not yes_tid:
-                continue  # skip markets where we can't trade YES easily
+            gamma_market_id = str(mid) if mid else None
+
+            # IMPORTANT CHANGE:
+            # We no longer "continue" if token is missing.
+            yes_tid = extract_yes_token_id(m)  # may be None
+
             upsert_event(
                 title=title,
                 slug=slug,
-                gamma_market_id=str(mid) if mid else None,
-                yes_token_id=yes_tid
+                gamma_market_id=gamma_market_id,
+                yes_token_id=yes_tid,
             )
             used += 1
 
         return {"ok": True, "job": job_name, "discovered": used}
 
     # -------------------------
-    # 2) SNAPSHOT POLYMARKET PRICES
+    # 2) SNAPSHOT PM PRICES (only where token exists)
     # -------------------------
     if job_name == "snapshot_pm":
         updated = 0
+        skipped_no_token = 0
         with db() as conn:
-            rows = conn.execute("SELECT id, yes_token_id FROM events WHERE yes_token_id IS NOT NULL").fetchall()
+            rows = conn.execute("SELECT id, yes_token_id FROM events").fetchall()
             for r in rows:
+                if not r["yes_token_id"]:
+                    skipped_no_token += 1
+                    continue
                 p = clob_midpoint(r["yes_token_id"])
                 if p is None:
                     continue
@@ -352,30 +375,48 @@ def admin_run_job(job_name: str, x_admin_token: Optional[str] = Header(None)):
                 conn.execute("UPDATE events SET latest_pm_p = ? WHERE id = ?", (p, r["id"]))
                 updated += 1
             conn.commit()
-        return {"ok": True, "job": job_name, "updated": updated}
+        return {
+            "ok": True,
+            "job": job_name,
+            "updated": updated,
+            "skipped_no_token": skipped_no_token,
+        }
 
     # -------------------------
-    # 3) FORECAST MACHINE FROM PM
+    # 3) FORECAST MACHINE (only where pm exists)
     # -------------------------
     if job_name == "forecast_machine":
         updated = 0
+        skipped_no_pm = 0
         with db() as conn:
-            rows = conn.execute("SELECT id, latest_pm_p FROM events WHERE latest_pm_p IS NOT NULL").fetchall()
+            rows = conn.execute("SELECT id, latest_pm_p FROM events").fetchall()
             for r in rows:
+                if r["latest_pm_p"] is None:
+                    skipped_no_pm += 1
+                    continue
                 p_m = machine_from_pm(float(r["latest_pm_p"]))
                 conn.execute("UPDATE events SET latest_machine_p = ? WHERE id = ?", (p_m, r["id"]))
                 updated += 1
             conn.commit()
-        return {"ok": True, "job": job_name, "updated": updated}
+        return {
+            "ok": True,
+            "job": job_name,
+            "updated": updated,
+            "skipped_no_pm": skipped_no_pm,
+        }
 
     # -------------------------
-    # 4) UPDATE PRICES (SNAPSHOT + FORECAST)
+    # 4) UPDATE PRICES (snapshot + forecast)
     # -------------------------
     if job_name == "update_prices":
         snap = 0
+        skipped_no_token = 0
         with db() as conn:
-            rows = conn.execute("SELECT id, yes_token_id FROM events WHERE yes_token_id IS NOT NULL").fetchall()
+            rows = conn.execute("SELECT id, yes_token_id FROM events").fetchall()
             for r in rows:
+                if not r["yes_token_id"]:
+                    skipped_no_token += 1
+                    continue
                 p = clob_midpoint(r["yes_token_id"])
                 if p is None:
                     continue
@@ -385,14 +426,25 @@ def admin_run_job(job_name: str, x_admin_token: Optional[str] = Header(None)):
             conn.commit()
 
         fore = 0
+        skipped_no_pm = 0
         with db() as conn:
-            rows = conn.execute("SELECT id, latest_pm_p FROM events WHERE latest_pm_p IS NOT NULL").fetchall()
+            rows = conn.execute("SELECT id, latest_pm_p FROM events").fetchall()
             for r in rows:
+                if r["latest_pm_p"] is None:
+                    skipped_no_pm += 1
+                    continue
                 p_m = machine_from_pm(float(r["latest_pm_p"]))
                 conn.execute("UPDATE events SET latest_machine_p = ? WHERE id = ?", (p_m, r["id"]))
                 fore += 1
             conn.commit()
 
-        return {"ok": True, "job": job_name, "snapshot_updated": snap, "forecast_updated": fore}
+        return {
+            "ok": True,
+            "job": job_name,
+            "snapshot_updated": snap,
+            "forecast_updated": fore,
+            "skipped_no_token": skipped_no_token,
+            "skipped_no_pm": skipped_no_pm,
+        }
 
     raise HTTPException(status_code=400, detail="Unhandled job")
