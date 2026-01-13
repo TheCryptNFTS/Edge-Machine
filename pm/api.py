@@ -38,7 +38,7 @@ DISCOVER_KEYWORDS = os.getenv(
 # APP
 # =========================
 
-app = FastAPI(title="Edge Machine API", version="0.8.0")
+app = FastAPI(title="Edge Machine API", version="0.9.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -134,7 +134,7 @@ def fnum(x) -> float:
 
 def machine_from_pm(p_pm: float) -> float:
     """
-    Minimal machine until you re-plug your v0.2 ensemble.
+    Minimal machine until you re-plug your full v0.2 ensemble.
     Stable & safe.
     """
     p = 0.90 * p_pm + 0.10 * 0.5
@@ -170,7 +170,7 @@ def clob_midpoint(token_id: str) -> Optional[float]:
     return None
 
 # =========================
-# POLYMARKET: GAMMA MARKETS
+# POLYMARKET: GAMMA
 # =========================
 
 def gamma_get_markets(limit: int = 100, offset: int = 0) -> list[dict]:
@@ -182,22 +182,31 @@ def gamma_get_markets(limit: int = 100, offset: int = 0) -> list[dict]:
         return data
     return data.get("markets") or data.get("data") or []
 
+def gamma_get_detail(mid: str) -> Optional[dict]:
+    # Token IDs often only exist on detail endpoints
+    for url in [f"{GAMMA_BASE}/markets/{mid}", f"{GAMMA_BASE}/market/{mid}"]:
+        try:
+            r = requests.get(url, timeout=15)
+            if r.status_code == 200:
+                return r.json()
+        except Exception:
+            pass
+    return None
+
 def extract_yes_token_id(m: dict) -> Optional[str]:
     """
     Best-effort YES token extraction.
-    We DO NOT fail discovery if this returns None anymore.
     """
     tokens = m.get("tokens") or m.get("outcomes") or []
     if isinstance(tokens, list):
         for t in tokens:
             label = (t.get("outcome") or t.get("label") or t.get("name") or "").strip().lower()
-            # common "yes"
             if label == "yes":
                 for k in ("token_id", "tokenId", "tokenID", "id", "clobTokenId"):
                     if t.get(k):
                         return str(t.get(k))
 
-    # fallback: clob token ids (binary markets often yes first)
+    # fallback: clobTokenIds (binary markets often yes first)
     clob_ids = m.get("clobTokenIds") or m.get("clob_token_ids")
     if isinstance(clob_ids, list) and clob_ids:
         return str(clob_ids[0])
@@ -208,6 +217,35 @@ def extract_yes_token_id(m: dict) -> Optional[str]:
             return str(m.get(k))
 
     return None
+
+def _try_parse_iso(dt_value) -> Optional[datetime]:
+    if not dt_value:
+        return None
+    try:
+        s = str(dt_value).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+def is_current(m: dict) -> bool:
+    """
+    Best-effort filter: try to avoid clearly closed markets.
+    Gamma schemas vary, so we keep this permissive.
+    """
+    # If an explicit active flag exists and is false -> drop
+    if "active" in m and m.get("active") is False:
+        return False
+
+    # Try common end/close fields
+    for k in ("end_date", "endDate", "closeTime", "close_time", "closeDate", "close_date"):
+        dt = _try_parse_iso(m.get(k))
+        if dt and dt < datetime.now(timezone.utc):
+            return False
+
+    return True
 
 def upsert_event(
     title: str,
@@ -221,16 +259,14 @@ def upsert_event(
         if slug:
             row = conn.execute("SELECT id FROM events WHERE slug = ?", (slug,)).fetchone()
 
-        # if no slug match, try gamma_market_id
         if not row and gamma_market_id:
             row = conn.execute("SELECT id FROM events WHERE gamma_market_id = ?", (gamma_market_id,)).fetchone()
 
-        # if no match and we have a token, match by token too
         if not row and yes_token_id:
             row = conn.execute("SELECT id FROM events WHERE yes_token_id = ?", (yes_token_id,)).fetchone()
 
         if row:
-            # Do not wipe existing token if new is None
+            # do not wipe token if new is None
             if yes_token_id:
                 conn.execute(
                     """UPDATE events
@@ -297,14 +333,14 @@ def admin_create_event(payload: EventCreate, x_admin_token: Optional[str] = Head
     return EventOut(id=eid, title=payload.title.strip())
 
 @app.post("/v1/admin/jobs/run")
-def admin_run_job(job_name: str, x_admin_token: Optional[str] = Header(None)):
+def admin_run_job(job_name: str = Query(...), x_admin_token: Optional[str] = Header(None)):
     check_admin(x_admin_token)
 
     if job_name not in {"discover_markets", "snapshot_pm", "forecast_machine", "update_prices"}:
         raise HTTPException(status_code=400, detail="Unknown job")
 
     # -------------------------
-    # 1) DISCOVER MARKETS (REAL)
+    # 1) DISCOVER MARKETS (REAL + DETAIL ENRICHMENT)
     # -------------------------
     if job_name == "discover_markets":
         keywords = [k.strip().lower() for k in DISCOVER_KEYWORDS.split(",") if k.strip()]
@@ -319,6 +355,8 @@ def admin_run_job(job_name: str, x_admin_token: Optional[str] = Header(None)):
             for m in markets:
                 title = (m.get("question") or m.get("title") or "").strip()
                 if not title:
+                    continue
+                if not is_current(m):
                     continue
 
                 tl = title.lower()
@@ -336,15 +374,18 @@ def admin_run_job(job_name: str, x_admin_token: Optional[str] = Header(None)):
         candidates.sort(key=lambda x: x[0], reverse=True)
 
         used = 0
+        tokened = 0
+
         for _, m in candidates[:DISCOVER_LIMIT]:
             title = (m.get("question") or m.get("title") or "").strip()
             slug = m.get("slug")
             mid = m.get("id") or m.get("marketId") or m.get("market_id")
             gamma_market_id = str(mid) if mid else None
+            if not gamma_market_id:
+                continue
 
-            # IMPORTANT CHANGE:
-            # We no longer "continue" if token is missing.
-            yes_tid = extract_yes_token_id(m)  # may be None
+            detail = gamma_get_detail(gamma_market_id) or m
+            yes_tid = extract_yes_token_id(detail)  # now much more likely
 
             upsert_event(
                 title=title,
@@ -353,8 +394,10 @@ def admin_run_job(job_name: str, x_admin_token: Optional[str] = Header(None)):
                 yes_token_id=yes_tid,
             )
             used += 1
+            if yes_tid:
+                tokened += 1
 
-        return {"ok": True, "job": job_name, "discovered": used}
+        return {"ok": True, "job": job_name, "discovered": used, "tokened": tokened}
 
     # -------------------------
     # 2) SNAPSHOT PM PRICES (only where token exists)
@@ -375,12 +418,7 @@ def admin_run_job(job_name: str, x_admin_token: Optional[str] = Header(None)):
                 conn.execute("UPDATE events SET latest_pm_p = ? WHERE id = ?", (p, r["id"]))
                 updated += 1
             conn.commit()
-        return {
-            "ok": True,
-            "job": job_name,
-            "updated": updated,
-            "skipped_no_token": skipped_no_token,
-        }
+        return {"ok": True, "job": job_name, "updated": updated, "skipped_no_token": skipped_no_token}
 
     # -------------------------
     # 3) FORECAST MACHINE (only where pm exists)
@@ -398,15 +436,10 @@ def admin_run_job(job_name: str, x_admin_token: Optional[str] = Header(None)):
                 conn.execute("UPDATE events SET latest_machine_p = ? WHERE id = ?", (p_m, r["id"]))
                 updated += 1
             conn.commit()
-        return {
-            "ok": True,
-            "job": job_name,
-            "updated": updated,
-            "skipped_no_pm": skipped_no_pm,
-        }
+        return {"ok": True, "job": job_name, "updated": updated, "skipped_no_pm": skipped_no_pm}
 
     # -------------------------
-    # 4) UPDATE PRICES (snapshot + forecast)
+    # 4) UPDATE PRICES (SNAPSHOT + FORECAST)
     # -------------------------
     if job_name == "update_prices":
         snap = 0
