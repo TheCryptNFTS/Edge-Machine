@@ -1,198 +1,221 @@
-import os
-import time
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel
 import sqlite3
-import secrets
 import requests
+import os
 from datetime import datetime, timezone
-from contextlib import closing
-from fastapi import FastAPI, HTTPException, Header, Query
+from typing import Optional, List
 
-from pm.ensemble import compute_machine_p
+DB_PATH = os.getenv("DB_PATH", "edge_machine.db")
+POLYMARKET_GAMMA = "https://gamma-api.polymarket.com"
 
-DB_PATH = os.getenv("PM_DB_PATH", "./auditor.db")
-ADMIN_TOKEN = os.getenv("PM_ADMIN_TOKEN", "edge-machine-admin-2026")
-GAMMA_BASE = "https://gamma-api.polymarket.com"
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "edge-machine-admin-2026")
 
-app = FastAPI(title="Edge Machine API", version="1.6.3")
+app = FastAPI(
+    title="Edge Machine API",
+    version="1.6.4"
+)
 
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+# -----------------------
+# DB helpers
+# -----------------------
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
-def init_db():
-    with closing(get_conn()) as c:
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS events (
-            id TEXT PRIMARY KEY,
-            title TEXT,
-            gamma_market_id TEXT UNIQUE,
-            latest_pm_p REAL,
-            latest_machine_p REAL,
-            created_at TEXT
-        )
-        """)
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS resolutions (
-            event_id TEXT PRIMARY KEY,
-            resolved_at TEXT,
-            outcome INTEGER,
-            crowd_p REAL,
-            machine_p REAL,
-            crowd_brier REAL,
-            machine_brier REAL
-        )
-        """)
-        c.commit()
 
-init_db()
+def now_utc():
+    return datetime.now(timezone.utc).isoformat()
+
+
+# -----------------------
+# Models
+# -----------------------
+
+class EventOut(BaseModel):
+    id: str
+    title: str
+    gamma_market_id: str
+    latest_pm_p: Optional[float]
+    latest_machine_p: Optional[float]
+    created_at: str
+
+
+# -----------------------
+# Health
+# -----------------------
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "time": now_utc()}
 
-@app.get("/v1/events")
+
+# -----------------------
+# Events
+# -----------------------
+
+@app.get("/v1/events", response_model=List[EventOut])
 def list_events(limit: int = 50):
-    with closing(get_conn()) as c:
-        rows = c.execute(
-            "SELECT id, title, gamma_market_id, latest_pm_p, latest_machine_p, created_at FROM events ORDER BY created_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+    db = get_db()
+    rows = db.execute(
+        """
+        SELECT id, title, gamma_market_id,
+               latest_pm_p, latest_machine_p, created_at
+        FROM events
+        ORDER BY created_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
     return [dict(r) for r in rows]
 
-def auth(token: str | None):
-    if not token or not secrets.compare_digest(token, ADMIN_TOKEN):
-        raise HTTPException(401, "Bad admin token")
 
-def _gamma_markets_payload_to_list(payload):
-    # Gamma sometimes returns: {"markets":[...]} OR {"data":[...]} OR just [...]
-    if isinstance(payload, list):
-        return payload
-    if isinstance(payload, dict):
-        return payload.get("markets") or payload.get("data") or payload.get("results") or []
-    return []
+# -----------------------
+# Admin job runner
+# -----------------------
 
 @app.post("/v1/admin/jobs/run")
 def run_job(
-    job_name: str = Query(...),
-    x_admin_token: str | None = Header(None)
+    job_name: str,
+    x_admin_token: Optional[str] = Header(default=None),
 ):
-    auth(x_admin_token)
-    t0 = time.time()
+    if x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
     if job_name == "discover_markets":
-        inserted = 0
-
-        # pull one page of active markets (small + safe)
-        resp = requests.get(
-            f"{GAMMA_BASE}/markets",
-            params={"active": "true", "closed": "false", "limit": 50, "offset": 0},
-            timeout=15
-        )
-        resp.raise_for_status()
-
-        markets = _gamma_markets_payload_to_list(resp.json())
-
-        with closing(get_conn()) as c:
-            for m in markets:
-                if time.time() - t0 > 10:
-                    break
-
-                mid = m.get("id")
-                title = (m.get("question") or m.get("title") or "").strip()
-                if mid is None or not title:
-                    continue
-
-                mid_s = str(mid)
-
-                c.execute("""
-                    INSERT OR IGNORE INTO events
-                    (id, title, gamma_market_id, created_at)
-                    VALUES (?, ?, ?, ?)
-                """, (
-                    mid_s,
-                    title,
-                    mid_s,
-                    datetime.now(timezone.utc).isoformat()
-                ))
-                inserted += 1
-
-            c.commit()
-
-        return {"ok": True, "job": job_name, "inserted": inserted}
-
+        return discover_markets()
+    if job_name == "hydrate_tokens":
+        return hydrate_tokens()
+    if job_name == "update_prices":
+        return update_prices()
     if job_name == "forecast_machine":
-        updated = 0
-        with closing(get_conn()) as c:
-            rows = c.execute("""
-                SELECT id, latest_pm_p FROM events
-                WHERE latest_pm_p IS NOT NULL
-                LIMIT 200
-            """).fetchall()
+        return forecast_machine()
 
-            for r in rows:
-                if time.time() - t0 > 10:
-                    break
-                mp = compute_machine_p(r["latest_pm_p"])
-                c.execute("UPDATE events SET latest_machine_p=? WHERE id=?", (mp, r["id"]))
-                updated += 1
+    raise HTTPException(status_code=400, detail="Unknown job")
 
-            c.commit()
 
-        return {"ok": True, "job": job_name, "updated": updated}
+# -----------------------
+# Jobs
+# -----------------------
 
-    if job_name == "resolve_markets":
-        resolved = 0
+def discover_markets(limit: int = 50):
+    r = requests.get(f"{POLYMARKET_GAMMA}/markets?limit={limit}")
+    r.raise_for_status()
+    markets = r.json()
 
-        with closing(get_conn()) as c:
-            rows = c.execute("""
-                SELECT e.id, e.gamma_market_id, e.latest_pm_p, e.latest_machine_p
-                FROM events e
-                LEFT JOIN resolutions r ON r.event_id = e.id
-                WHERE r.event_id IS NULL
-                LIMIT 200
-            """).fetchall()
+    db = get_db()
+    inserted = 0
 
-            for r in rows:
-                if time.time() - t0 > 10:
-                    break
+    for m in markets:
+        db.execute(
+            """
+            INSERT OR IGNORE INTO events
+            (id, title, gamma_market_id, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                str(m["id"]),
+                m["question"],
+                str(m["id"]),
+                now_utc(),
+            ),
+        )
+        inserted += 1
 
-                try:
-                    resp = requests.get(f"{GAMMA_BASE}/markets/{r['gamma_market_id']}", timeout=10)
-                    if not resp.ok:
-                        continue
+    db.commit()
+    return {"ok": True, "job": "discover_markets", "inserted": inserted}
 
-                    m = resp.json()
-                    if not m.get("closed"):
-                        continue
 
-                    outcome = (m.get("outcome") or "").strip()
-                    if outcome not in ("Yes", "No"):
-                        continue
+def hydrate_tokens():
+    db = get_db()
+    rows = db.execute(
+        "SELECT id, gamma_market_id FROM events WHERE yes_token_id IS NULL"
+    ).fetchall()
 
-                    y = 1 if outcome == "Yes" else 0
-                    cp = float(r["latest_pm_p"] or 0.5)
-                    mp = float(r["latest_machine_p"] or 0.5)
+    attempted = 0
+    hydrated = 0
 
-                    c.execute("""
-                        INSERT OR REPLACE INTO resolutions
-                        (event_id, resolved_at, outcome, crowd_p, machine_p, crowd_brier, machine_brier)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        r["id"],
-                        datetime.now(timezone.utc).isoformat(),
-                        y,
-                        cp,
-                        mp,
-                        (cp - y) ** 2,
-                        (mp - y) ** 2
-                    ))
-                    resolved += 1
-                except Exception:
-                    continue
+    for r in rows:
+        attempted += 1
+        market_id = r["gamma_market_id"]
 
-            c.commit()
+        resp = requests.get(f"{POLYMARKET_GAMMA}/markets/{market_id}")
+        if resp.status_code != 200:
+            continue
 
-        return {"ok": True, "job": job_name, "resolved": resolved}
+        data = resp.json()
+        yes_token = next(
+            (t["id"] for t in data.get("tokens", []) if t["outcome"] == "Yes"),
+            None,
+        )
 
-    raise HTTPException(400, "Unknown job")
+        if yes_token:
+            db.execute(
+                "UPDATE events SET yes_token_id=? WHERE id=?",
+                (yes_token, r["id"]),
+            )
+            hydrated += 1
+
+    db.commit()
+    return {
+        "ok": True,
+        "job": "hydrate_tokens",
+        "attempted": attempted,
+        "hydrated": hydrated,
+    }
+
+
+def update_prices():
+    db = get_db()
+    rows = db.execute(
+        "SELECT id, yes_token_id FROM events WHERE yes_token_id IS NOT NULL"
+    ).fetchall()
+
+    updated = 0
+
+    for r in rows:
+        token_id = r["yes_token_id"]
+
+        resp = requests.get(f"{POLYMARKET_GAMMA}/token/{token_id}")
+        if resp.status_code != 200:
+            continue
+
+        data = resp.json()
+        price = data.get("price")
+
+        if price is not None:
+            db.execute(
+                "UPDATE events SET latest_pm_p=? WHERE id=?",
+                (float(price), r["id"]),
+            )
+            updated += 1
+
+    db.commit()
+    return {"ok": True, "job": "update_prices", "updated": updated}
+
+
+def forecast_machine():
+    """
+    Very simple baseline:
+    machine_p = crowd_p (for now)
+    This exists so the pipeline is complete.
+    You can swap this later with real models.
+    """
+    db = get_db()
+    rows = db.execute(
+        "SELECT id, latest_pm_p FROM events WHERE latest_pm_p IS NOT NULL"
+    ).fetchall()
+
+    updated = 0
+
+    for r in rows:
+        db.execute(
+            "UPDATE events SET latest_machine_p=? WHERE id=?",
+            (r["latest_pm_p"], r["id"]),
+        )
+        updated += 1
+
+    db.commit()
+    return {"ok": True, "job": "forecast_machine", "updated": updated}
