@@ -14,12 +14,13 @@ from fastapi import FastAPI, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from pm.ensemble import compute_machine_p
+
 # ======================================================
 # CONFIG
 # ======================================================
 
 DB_PATH = os.getenv("PM_DB_PATH", "./pm.db")
-
 ADMIN_TOKEN = os.getenv("PM_ADMIN_TOKEN", "edge-machine-admin-2026")
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
@@ -32,6 +33,7 @@ DISCOVER_DETAIL_MAX = 25
 
 HYDRATE_MAX = 50
 PRICE_UPDATE_MAX = 50
+FORECAST_MAX = 200
 
 JOB_TIME_BUDGET_SECS = 12
 
@@ -39,7 +41,7 @@ JOB_TIME_BUDGET_SECS = 12
 # APP
 # ======================================================
 
-app = FastAPI(title="Edge Machine API", version="1.4.0")
+app = FastAPI(title="Edge Machine API", version="1.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -104,9 +106,6 @@ def check_admin(x_admin_token: Optional[str]):
 def clamp01(x: float) -> float:
     return max(0.0, min(1.0, float(x)))
 
-def machine_from_pm(p: float) -> float:
-    return clamp01(0.9 * p + 0.05)
-
 # ======================================================
 # POLYMARKET HELPERS
 # ======================================================
@@ -118,7 +117,11 @@ def gamma_markets(limit: int, offset: int) -> list[dict]:
         timeout=15,
     )
     r.raise_for_status()
-    return r.json().get("markets", [])
+    data = r.json()
+    # gamma sometimes returns list OR dict
+    if isinstance(data, list):
+        return data
+    return data.get("markets") or data.get("data") or []
 
 def gamma_detail(mid: str) -> Optional[dict]:
     try:
@@ -131,15 +134,18 @@ def gamma_detail(mid: str) -> Optional[dict]:
 
 def extract_yes_token_id(m: dict) -> Optional[str]:
     tokens = m.get("tokens") or m.get("outcomes") or []
-    for t in tokens:
-        label = (t.get("label") or t.get("outcome") or "").lower()
-        if label == "yes":
-            for k in ("token_id", "tokenId", "id", "clobTokenId"):
-                if t.get(k):
-                    return str(t[k])
+    if isinstance(tokens, list):
+        for t in tokens:
+            label = (t.get("label") or t.get("outcome") or "").strip().lower()
+            if label == "yes":
+                for k in ("token_id", "tokenId", "id", "clobTokenId"):
+                    if t.get(k):
+                        return str(t[k])
 
+    # fallback ONLY if it is a list of length 2
     ids = m.get("clobTokenIds")
     if isinstance(ids, list) and len(ids) == 2:
+        # ordering NOT guaranteed; but better than nothing
         return str(ids[0])
 
     return None
@@ -152,7 +158,10 @@ def clob_midpoint(token_id: str) -> Optional[float]:
             timeout=10,
         )
         r.raise_for_status()
-        return float(r.json().get("midpoint"))
+        mp = r.json().get("midpoint")
+        if mp is None:
+            return None
+        return float(mp)
     except Exception:
         return None
 
@@ -180,7 +189,7 @@ def run_job(
 ):
     check_admin(x_admin_token)
 
-    if job_name not in {"discover_markets", "hydrate_tokens", "update_prices"}:
+    if job_name not in {"discover_markets", "hydrate_tokens", "update_prices", "forecast_machine"}:
         raise HTTPException(400, "Unknown job")
 
     t0 = time.time()
@@ -212,7 +221,7 @@ def run_job(
                     yes_tid = extract_yes_token_id(m)
 
                     if not yes_tid and detail_calls < DISCOVER_DETAIL_MAX:
-                        d = gamma_detail(mid)
+                        d = gamma_detail(str(mid))
                         detail_calls += 1
                         if d:
                             yes_tid = extract_yes_token_id(d)
@@ -296,11 +305,10 @@ def run_job(
         }
 
     # ==================================================
-    # UPDATE PRICES
+    # UPDATE PRICES (ONLY PRICES)
     # ==================================================
     if job_name == "update_prices":
         snap = 0
-        fore = 0
         skipped = 0
 
         with closing(get_conn()) as conn:
@@ -331,24 +339,56 @@ def run_job(
                 )
                 snap += 1
 
-            rows2 = conn.execute(
-                "SELECT id, latest_pm_p FROM events WHERE latest_pm_p IS NOT NULL",
-            ).fetchall()
-
-            for r in rows2:
-                conn.execute(
-                    "UPDATE events SET latest_machine_p=? WHERE id=?",
-                    (machine_from_pm(r["latest_pm_p"]), r["id"]),
-                )
-                fore += 1
-
             conn.commit()
 
         return {
             "ok": True,
             "job": job_name,
             "snapshot_updated": snap,
-            "forecast_updated": fore,
             "skipped_no_token": skipped,
+            "time_secs": round(time.time() - t0, 3),
+        }
+
+    # ==================================================
+    # FORECAST MACHINE (ONLY MACHINE)
+    # ==================================================
+    if job_name == "forecast_machine":
+        updated = 0
+        skipped = 0
+
+        with closing(get_conn()) as conn:
+            rows = conn.execute(
+                """
+                SELECT id, latest_pm_p
+                FROM events
+                WHERE latest_pm_p IS NOT NULL
+                LIMIT ?
+                """,
+                (FORECAST_MAX,),
+            ).fetchall()
+
+            for r in rows:
+                if time.time() - t0 > JOB_TIME_BUDGET_SECS:
+                    break
+
+                p = r["latest_pm_p"]
+                if p is None:
+                    skipped += 1
+                    continue
+
+                machine_p = compute_machine_p(float(p))
+                conn.execute(
+                    "UPDATE events SET latest_machine_p=? WHERE id=?",
+                    (machine_p, r["id"]),
+                )
+                updated += 1
+
+            conn.commit()
+
+        return {
+            "ok": True,
+            "job": job_name,
+            "updated": updated,
+            "skipped": skipped,
             "time_secs": round(time.time() - t0, 3),
         }
