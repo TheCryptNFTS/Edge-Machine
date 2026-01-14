@@ -1,108 +1,132 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <title>Edge Machine</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta charset="utf-8">
+  <title>Probability Auditor</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
-
 <body class="bg-gray-950 text-gray-100 min-h-screen font-sans">
-  <div class="max-w-5xl mx-auto px-4 py-8">
-
-    <div class="flex items-center justify-between mb-8">
-      <h1 class="text-3xl font-bold">Edge Machine</h1>
-      <button id="refresh"
-        class="px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded transition">
+  <div class="max-w-6xl mx-auto px-4 py-8">
+    <div class="flex items-center justify-between mb-6">
+      <h1 class="text-3xl font-bold">Probability Auditor</h1>
+      <button id="refresh" class="px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded">
         Refresh
       </button>
     </div>
 
-    <div id="status" class="mb-6 text-lg font-medium">
-      Loading…
-    </div>
+    <div id="status" class="mb-4 text-lg">Loading…</div>
 
     <div class="overflow-x-auto">
       <table class="w-full text-sm border-collapse">
         <thead>
           <tr class="bg-gray-800">
             <th class="p-3 text-left">Event</th>
-            <th class="p-3 text-left">Crowd (PM)</th>
-            <th class="p-3 text-left">Machine</th>
-            <th class="p-3 text-left">Signal</th>
+            <th class="p-3 text-left">Vol (24h)</th>
+            <th class="p-3 text-left">Crowd YES</th>
+            <th class="p-3 text-left">Auditor YES</th>
+            <th class="p-3 text-left">Divergence</th>
           </tr>
         </thead>
         <tbody id="table"></tbody>
       </table>
     </div>
 
-    <div id="error" class="mt-6 text-red-400 hidden"></div>
+    <div class="mt-6 p-4 bg-gray-900 rounded">
+      <div class="text-lg font-semibold mb-2">Brier Scoreboard</div>
+      <pre id="brier" class="text-sm text-gray-200">—</pre>
+    </div>
 
+    <div id="error" class="mt-6 text-red-400 hidden"></div>
   </div>
 
-<script>
-  // ✅ LIVE RAILWAY API
-  const API = "https://edge-machine-production.up.railway.app";
+  <script>
+    const API = "https://edge-machine-production.up.railway.app";
 
-  async function load() {
-    const status = document.getElementById("status");
-    const table = document.getElementById("table");
-    const error = document.getElementById("error");
-
-    error.classList.add("hidden");
-    table.innerHTML = "";
-    status.textContent = "Loading markets…";
-
-    try {
-      const res = await fetch(API + "/v1/events?limit=10");
-      if (!res.ok) throw new Error("API error " + res.status);
-
-      const data = await res.json();
-
-      if (!data.length) {
-        status.textContent = "No events yet — backend alive, waiting for bootstrap";
-        return;
-      }
-
-      data.forEach(e => {
-        const crowd = e.latest_pm_p != null
-          ? (e.latest_pm_p * 100).toFixed(1) + "%"
-          : "—";
-
-        const machine = e.latest_machine_p != null
-          ? (e.latest_machine_p * 100).toFixed(1) + "%"
-          : "—";
-
-        const fade = e.latest_pm_p != null && e.latest_machine_p != null
-          && e.latest_pm_p > e.latest_machine_p;
-
-        const signal = fade ? "FADE YES" : "RIDE YES";
-        const color = fade ? "text-red-400" : "text-emerald-400";
-
-        const row = document.createElement("tr");
-        row.className = "border-b border-gray-800";
-        row.innerHTML = `
-          <td class="p-3">${e.title}</td>
-          <td class="p-3">${crowd}</td>
-          <td class="p-3">${machine}</td>
-          <td class="p-3 font-bold ${color}">${signal}</td>
-        `;
-        table.appendChild(row);
-      });
-
-      status.textContent = "Live";
-
-    } catch (err) {
-      status.textContent = "Error connecting";
-      error.textContent = err.message;
-      error.classList.remove("hidden");
+    function pct(x) {
+      if (x === null || x === undefined) return "—";
+      return (x * 100).toFixed(1) + "%";
     }
-  }
+    function num(x) {
+      if (x === null || x === undefined) return "—";
+      const n = Number(x);
+      if (!isFinite(n)) return "—";
+      if (n >= 1_000_000) return (n/1_000_000).toFixed(2) + "M";
+      if (n >= 1_000) return (n/1_000).toFixed(1) + "K";
+      return n.toFixed(0);
+    }
 
-  document.getElementById("refresh").onclick = load;
-  load();
-  setInterval(load, 30000);
-</script>
+    async function load() {
+      const status = document.getElementById("status");
+      const table = document.getElementById("table");
+      const error = document.getElementById("error");
+      const brier = document.getElementById("brier");
 
+      error.classList.add("hidden");
+      status.textContent = "Loading…";
+
+      try {
+        const r = await fetch(API + "/v1/events?limit=50");
+        if (!r.ok) throw new Error("events fetch failed: " + r.status);
+        const data = await r.json();
+
+        table.innerHTML = "";
+        if (!data.length) {
+          status.textContent = "No events yet — waiting for discovery.";
+        } else {
+          status.textContent = "Live";
+        }
+
+        data.forEach(e => {
+          const crowd = e.latest_pm_p;
+          const mach  = e.latest_machine_p;
+
+          const crowdTxt = pct(crowd);
+          const machTxt = pct(mach);
+
+          let divTxt = "—";
+          let divColor = "text-gray-400";
+          if (crowd !== null && mach !== null && crowd !== undefined && mach !== undefined) {
+            const diff = (mach - crowd);
+            divTxt = (diff >= 0 ? "+" : "") + (diff*100).toFixed(1) + " pts";
+            divColor = Math.abs(diff) >= 0.10 ? "text-amber-300" : "text-gray-200";
+          }
+
+          const row = document.createElement("tr");
+          row.className = "border-b border-gray-800";
+          row.innerHTML = `
+            <td class="p-3">${e.title || "—"}</td>
+            <td class="p-3">${num(e.volume24hr)}</td>
+            <td class="p-3">${crowdTxt}</td>
+            <td class="p-3">${machTxt}</td>
+            <td class="p-3 font-bold ${divColor}">${divTxt}</td>
+          `;
+          table.appendChild(row);
+        });
+
+        // Brier scoreboard
+        try {
+          const br = await fetch(API + "/v1/scoreboard/brier");
+          if (br.ok) {
+            const bj = await br.json();
+            brier.textContent = JSON.stringify(bj, null, 2);
+          } else {
+            brier.textContent = "Brier endpoint error: " + br.status;
+          }
+        } catch (e) {
+          brier.textContent = "Brier fetch failed: " + e.message;
+        }
+
+      } catch (e) {
+        status.textContent = "Error connecting";
+        error.textContent = e.message;
+        error.classList.remove("hidden");
+      }
+    }
+
+    document.getElementById("refresh").onclick = load;
+    load();
+    setInterval(load, 30000);
+  </script>
 </body>
 </html>
