@@ -1,30 +1,38 @@
 import os
-import sys
+import time
 import requests
 
-PM_API_BASE = os.getenv("PM_API_BASE")
-PM_ADMIN_TOKEN = os.getenv("PM_ADMIN_TOKEN")
-JOB_NAME = os.getenv("JOB_NAME")
+API = os.environ.get("PM_API_BASE", "http://localhost:8000").rstrip("/")
+TOKEN = os.environ["PM_ADMIN_TOKEN"]
+JOB = os.environ["JOB_NAME"]
 
-if not PM_API_BASE:
-    print("Missing PM_API_BASE")
-    sys.exit(1)
-if not PM_ADMIN_TOKEN:
-    print("Missing PM_ADMIN_TOKEN")
-    sys.exit(1)
-if not JOB_NAME:
-    print("Missing JOB_NAME")
-    sys.exit(1)
+def wait_for_health() -> bool:
+    for _ in range(15):
+        try:
+            r = requests.get(f"{API}/health", timeout=5)
+            if r.ok:
+                return True
+        except Exception:
+            pass
+        time.sleep(2)
+    return False
 
-url = f"{PM_API_BASE.rstrip('/')}/v1/admin/jobs/run"
-params = {"job_name": JOB_NAME}
-headers = {"x-admin-token": PM_ADMIN_TOKEN}
+if not wait_for_health():
+    raise SystemExit("API not healthy after 30s")
 
-print(f"Running job: {JOB_NAME}")
-r = requests.post(url, params=params, headers=headers, timeout=30)
+url = f"{API}/v1/admin/jobs/run"
+params = {"job_name": JOB}
+headers = {"x-admin-token": TOKEN}
 
-print("Status:", r.status_code)
-print(r.text)
+last_err = None
+for attempt in range(4):
+    try:
+        r = requests.post(url, params=params, headers=headers, timeout=30)
+        print(f"Status: {r.status_code} | {r.text}")
+        r.raise_for_status()
+        raise SystemExit(0)
+    except Exception as e:
+        last_err = e
+        time.sleep(1.5 * (attempt + 1))
 
-if r.status_code != 200:
-    sys.exit(1)
+raise SystemExit(f"Job failed after retries: {last_err}")
